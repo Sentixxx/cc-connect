@@ -6722,6 +6722,136 @@ func TestCmdStop_ReturnsWhileCloseBlockedAndStopsEventLoop(t *testing.T) {
 	}
 }
 
+// TestStateInconsistencyDuringCleanup_ContradictoryRepliesToUser reproduces
+// the user-visible state inconsistency that produced two contradictory bot
+// replies within the same minute:
+//
+//	user sends "1"     -> "Previous request is still processing..." (MsgPreviousProcessing)
+//	user sends "/stop" -> "No task currently executing."            (MsgNoExecution)
+//
+// Both replies are emitted while the underlying state is identical:
+// `interactiveStates[key]` has already been deleted by cleanupInteractiveState
+// but the session lock is still held by some goroutine (typically the turn
+// goroutine, which has not yet returned from its event loop). The two
+// handlers observe the same condition (state missing + session locked) and
+// reach contradictory conclusions:
+//
+//   - queueMessageForBusySession sees the missing state, returns false, and
+//     the caller in handleMessage replies MsgPreviousProcessing because
+//     TryLock failed earlier.
+//   - stopInteractiveSession also sees the missing state and returns false,
+//     which cmdStop translates into MsgNoExecution.
+//
+// The bug is architectural: state-map presence and session-lock ownership
+// are separate sources of truth that handlers consult independently. The
+// readLoop fix in this PR shrinks the time window during which the two can
+// disagree (closeAgentSessionWithTimeout no longer blocks for 130s when a
+// child process keeps the agent's stdout pipe open), but it does not make
+// the two sources atomic. Consequently this test still demonstrates the
+// inconsistency on a sufficiently slow Close(), simulated here with
+// blockingCloseAgentSession.
+//
+// Expected status:
+//   - On any commit through HEAD of this branch: FAIL — the two replies
+//     remain contradictory.
+//   - On a follow-up commit that addresses the architectural inconsistency
+//     (e.g. cmdStop replying MsgPreviousProcessing when the session lock
+//     is still held, or routing both handlers through a single "session
+//     resetting" message): PASS.
+func TestStateInconsistencyDuringCleanup_ContradictoryRepliesToUser(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sess := newBlockingCloseSession("inconsistent")
+
+	key := "test:user1"
+	session := e.sessions.GetOrCreateActive(key)
+
+	// Set up an active interactive state — as if a turn were in progress.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Acquire and hold the session lock. This stands in for the turn
+	// goroutine that has not yet returned from processInteractiveMessageWith
+	// (e.g. its event loop is mid-iteration in a slow platform.send retry).
+	if !session.TryLock() {
+		t.Fatal("expected to acquire fresh session lock")
+	}
+	defer session.Unlock()
+
+	// Trigger cleanupInteractiveState. Step 1 (delete state from map) is
+	// instant; step 2 (closeAgentSessionWithTimeout -> Close) blocks here
+	// until we release sess.releaseClose. While Close blocks, the state
+	// is gone but the session lock is still held — the inconsistency
+	// window the user observed.
+	cleanupDone := make(chan struct{})
+	go func() {
+		e.cleanupInteractiveState(key)
+		close(cleanupDone)
+	}()
+	select {
+	case <-sess.closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup goroutine never reached the blocking Close()")
+	}
+
+	// Sanity check: state has been deleted, lock is held.
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if exists {
+		t.Fatal("state should be deleted before Close() was reached")
+	}
+
+	// 1. User sends a regular message "1". handleMessage hits the
+	//    `!session.TryLock()` branch, queueMessageForBusySession returns
+	//    false (state missing), and the caller replies MsgPreviousProcessing.
+	msgRegular := &Message{SessionKey: key, Content: "1", ReplyCtx: "ctx"}
+	queued := e.queueMessageForBusySession(p, msgRegular, key)
+	if queued {
+		t.Fatal("queueMessageForBusySession should not have queued during cleanup window")
+	}
+	regularReply := e.i18n.T(MsgPreviousProcessing)
+
+	// 2. User sends /stop. cmdStop calls stopInteractiveSession, which
+	//    returns false (state missing), and replies MsgNoExecution.
+	p.clearSent()
+	e.cmdStop(p, &Message{SessionKey: key, ReplyCtx: "ctx"})
+	stopSent := p.getSent()
+	if len(stopSent) != 1 {
+		t.Fatalf("/stop produced %d replies, want 1: %v", len(stopSent), stopSent)
+	}
+	stopReply := stopSent[0]
+
+	// Release Close so the cleanup goroutine can finish, regardless of
+	// the assertion outcome below.
+	close(sess.releaseClose)
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup did not finish after release")
+	}
+
+	// The bug: the two replies refer to the same underlying state but say
+	// contradictory things to the user.
+	busyMsg := e.i18n.T(MsgPreviousProcessing)
+	noTaskMsg := e.i18n.T(MsgNoExecution)
+	if regularReply == busyMsg && stopReply == noTaskMsg {
+		t.Errorf("CONTRADICTORY user-visible replies during cleanup window:\n"+
+			"  regular message -> %q\n"+
+			"  /stop           -> %q\n"+
+			"Both handlers observed `state missing + session locked` but "+
+			"reached contradictory conclusions. Fix the architectural "+
+			"inconsistency by making the two reply paths agree on what "+
+			"this transient state means.", regularReply, stopReply)
+	}
+}
+
 func TestExecuteCardAction_NewCleansUpAndCreatesSession(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
