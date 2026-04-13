@@ -5678,6 +5678,23 @@ func (e *Engine) cmdTTS(p Platform, msg *Message, args []string) {
 func (e *Engine) cmdStop(p Platform, msg *Message) {
 	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
 	if !e.stopInteractiveSession(iKey, p, msg.ReplyCtx) {
+		// State is gone from the interactive map. There are two possible
+		// realities behind this:
+		//   a) Truly no active session — reply MsgNoExecution as before.
+		//   b) Session is mid-cleanup: cleanupInteractiveState already
+		//      removed the state but the turn goroutine has not yet
+		//      released the session lock. From the user's perspective a
+		//      turn is still in flight, so we must reply consistently
+		//      with handleMessage's "session busy" path
+		//      (MsgPreviousProcessing) — otherwise a regular message and
+		//      a /stop sent moments apart yield contradictory replies.
+		_, sessions := e.sessionContextForKey(msg.SessionKey)
+		session := sessions.GetOrCreateActive(msg.SessionKey)
+		if !session.TryLock() {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+			return
+		}
+		session.Unlock()
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoExecution))
 		return
 	}
