@@ -194,6 +194,16 @@ func (cs *claudeSession) startReadLoopWait(stdout io.ReadCloser) (<-chan error, 
 		case <-cs.ctx.Done():
 		case <-waitDone:
 		}
+		
+		// Grace period: give scanner a brief window to drain any data the
+		// agent wrote to the pipe buffer before exiting. If scanner finishes
+		// on its own (pipe fully closed, no descendants holding it),
+		// cs.done fires first and we skip the force-close entirely
+		select {
+		case<-cs.done:
+				return
+		case<-time.After(500*time.Millisecond):
+		}
 		_ = stdout.Close()
 	}()
 
